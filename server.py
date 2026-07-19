@@ -3,16 +3,21 @@ Run:  uvicorn server:app --reload --host 0.0.0.0 --port 8000
 """
 
 from __future__ import annotations
-from fastapi import WebSocket
-from game import Question, build_deck, score_round
+from fastapi import WebSocket, FastAPI, WebSocketDisconnect
+from game import PLAYER_COLORS, Question, build_deck, score_round
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 import asyncio
 import scraper
 import random
 import string
+import uuid
 
 MAX_ROUNDS = 10
+MAX_PLAYERS = 8
 ROUND_SECONDS = 45
 ROOM_TTL_EMPTY = 600
+app = FastAPI()
 
 # --------------------------------------------------------------------------
 # Room / player state
@@ -235,3 +240,145 @@ def new_room_code() -> str:
         code = "".join(random.choices(string.ascii_uppercase, k=4))
         if code not in rooms:
             return code
+
+
+# --------------------------------------------------------------------------
+# WebSocket endpoint
+# --------------------------------------------------------------------------
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    room: Room | None = None
+    player: Player | None = None
+
+    async def err(message: str):
+        await ws.send_json({"type": "error", "message": message})
+
+    try:
+        while True:
+            msg = await ws.receive_json()
+            mtype = msg.get("type")
+
+            if mtype == "create":
+                room = Room(new_room_code())
+                rooms[room.code] = room
+                player = _add_player(room, msg, ws)
+                room.host_id = player.id
+                await _welcome(room, player)
+
+            elif mtype == "join":
+                code = str(msg.get("room", "")).upper().strip()
+                room = rooms.get(code)
+                if not room:
+                    await err("Room not found — check the code.")
+                    room = None
+                    continue
+                if room.state != "LOBBY":
+                    await err("That game has already started.")
+                    room = None
+                    continue
+                if len(room.players) >= MAX_PLAYERS:
+                    await err(f"Room is full ({MAX_PLAYERS} players max).")
+                    room = None
+                    continue
+                player = _add_player(room, msg, ws)
+                await _welcome(room, player)
+
+            elif mtype == "rejoin":
+                room = rooms.get(str(msg.get("room", "")).upper())
+                pid = msg.get("player_id")
+                if not room or pid not in room.players:
+                    await err("Couldn't rejoin that game.")
+                    room = None
+                    continue
+                player = room.players[pid]
+                player.ws = ws
+                room.maybe_reap()
+                await _welcome(room, player, rejoined=True)
+
+            elif not room or not player:
+                await err("Join a room first.")
+
+            elif mtype == "start":
+                async with room.lock:
+                    if player.id == room.host_id and room.state == "LOBBY":
+                        if len(room.players) < 2:
+                            await err("You need at least 2 players.")
+                        else:
+                            asyncio.create_task(room.start_game())
+
+            elif mtype == "vote":
+                async with room.lock:
+                    await room.submit_vote(player.id, msg.get("guess"))
+
+            elif mtype == "next":
+                async with room.lock:
+                    if player.id == room.host_id and room.state == "REVEAL":
+                        await room.next_round()
+
+            elif mtype == "again":
+                async with room.lock:
+                    if player.id == room.host_id and room.state == "GAME_OVER":
+                        room.state = "LOBBY"
+                        await room.broadcast(room.snapshot())
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if room and player and player.ws is ws:
+            player.ws = None
+            await room.broadcast(room.snapshot())
+            room.maybe_reap()
+
+
+def _add_player(room: Room, msg: dict, ws: WebSocket) -> Player:
+    name = str(msg.get("name", "")).strip()[:20] or "Anon"
+    lb = str(msg.get("letterboxd", "")).strip()[:40]
+    color = PLAYER_COLORS[len(room.players) % len(PLAYER_COLORS)]
+    p = Player(str(uuid.uuid4()), name, lb, color)
+    p.ws = ws
+    room.players[p.id] = p
+    return p
+
+
+async def _welcome(room: Room, player: Player, rejoined: bool = False):
+    await player.ws.send_json(
+        {
+            "type": "joined",
+            "room": room.code,
+            "player_id": player.id,
+            "is_host": player.id == room.host_id,
+            "rejoined": rejoined,
+        }
+    )
+    await room.broadcast(room.snapshot())
+    if rejoined and room.state == "ROUND" and 0 <= room.round_i < len(room.deck):
+        q = room.deck[room.round_i]
+        await player.ws.send_json(
+            {
+                "type": "round_start",
+                "round": room.round_i + 1,
+                "total": len(room.deck),
+                "film": q.review.film,
+                "year": q.review.year,
+                "rating": q.review.rating,
+                "shared": q.shared,
+                "text": q.review.text,
+                "seconds": ROUND_SECONDS,
+                "players": [p.public() for p in room.players.values()],
+            }
+        )
+
+
+# --------------------------------------------------------------------------
+# Static frontend
+# --------------------------------------------------------------------------
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/")
+async def index():
+    return FileResponse("static/index.html")
