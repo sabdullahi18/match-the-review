@@ -1,6 +1,6 @@
 """Letterboxd review scraper.
 
-Scrapes public review pages (https://letterboxd.com/{user}/reviews/films/page/N/).
+Scrapes public review pages (https://letterboxd.com/{username}/reviews/films/page/N/).
 
 - only fetches the first MAX_PAGES pages per user (~12 reviews per page)
 - random delay between pagination requests
@@ -9,18 +9,23 @@ Scrapes public review pages (https://letterboxd.com/{user}/reviews/films/page/N/
 """
 
 from __future__ import annotations
-from curl_cffi import requests
 from bs4 import BeautifulSoup
 from game import Review
+from pathlib import Path
+from dataclasses import asdict
 import re
+import json
+import time
+import asyncio
+import random
 
 try:
-    import httpx
+    from curl_cffi.requests import AsyncSession
 except ImportError:
-    httpx = None
+    AsyncSession = None
 
-url = "https://letterboxd.com/{user}/reviews/films/page/1/"
-headers = {
+URL = "https://letterboxd.com/{username}/reviews/films/page/{page}/"
+HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
@@ -32,18 +37,11 @@ headers = {
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
 }
-
-spoiler_marker = "this review may contain spoilers"
-
-print(f"Fetching {url}...")
-response = requests.get(url, headers=headers, impersonate="chrome120")
-
-if response.status_code == 200:
-    with open("sample_page.html", "w", encoding="utf-8") as f:
-        f.write(response.text)
-    print("Success! Saved to 'sample_page.html'.")
-else:
-    print(f"Failed. Status code: {response.status_code}")
+SPOILER_MARKER = "this review may contain spoilers"
+MAX_PAGES = 50
+CACHE_DIR = Path(".cache")
+CACHE_TTL_SECONDS = 24 * 3600
+REQUEST_TIMEOUT = 15.0
 
 #########
 # Parsing
@@ -83,7 +81,7 @@ def parse_reviews_page(html: str, username: str) -> list[Review]:
         paragraphs = [
             p.get_text(" ", strip=True)
             for p in body.find_all("p")
-            if spoiler_marker not in p.get_text(strip=True).lower()
+            if SPOILER_MARKER not in p.get_text(strip=True).lower()
         ]
         text = "\n\n".join(p for p in paragraphs if p).strip()
 
@@ -95,3 +93,104 @@ def parse_reviews_page(html: str, username: str) -> list[Review]:
         )
 
     return out
+
+
+#########
+# Caching
+#########
+
+
+def _cache_path(username: str) -> Path:
+    safe = re.sub(r"[^a-z0-9_-]", "_", username.lower())
+    return CACHE_DIR / f"{safe}.json"
+
+
+def _cache_load(username: str) -> list[Review] | None:
+    path = _cache_path(username)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        if time.time() - data["fetched_at"] > CACHE_TTL_SECONDS:
+            return None
+        return [Review(**r) for r in data["reviews"]]
+    except Exception:
+        return None
+
+
+def _cache_save(username: str, reviews: list[Review]) -> None:
+    CACHE_DIR.mkdir(exist_ok=True)
+    _cache_path(username).write_text(
+        json.dumps(
+            {
+                "fetched_at": time.time(),
+                "reviews": [asdict(r) for r in reviews],
+            }
+        )
+    )
+
+
+##########
+# Fetching
+##########
+
+
+class ScrapeError(Exception):
+    pass
+
+
+async def fetch_user_reviews(
+    client: AsyncSession, username: str, max_pages: int = MAX_PAGES
+) -> list[Review]:
+    cached = _cache_load(username)
+    if cached is not None:
+        return cached
+
+    reviews: list[Review] = []
+    for page in range(1, max_pages + 1):
+        url = URL.format(username=username, page=page)
+
+        resp = await client.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+
+        if resp.status_code == 404:
+            if page == 1:
+                raise ScrapeError(f"Letterboxd user '{username}' not found")
+            break
+        if resp.status_code != 200:
+            break  # rate limited / Cloudflare block / hiccup: keep whatever we have so far
+
+        page_reviews = parse_reviews_page(resp.text, username)
+        if not page_reviews:
+            break  # ran out of reviews
+
+        reviews.extend(page_reviews)
+        await asyncio.sleep(random.uniform(0.4, 0.9))
+
+    _cache_save(username, reviews)
+    return reviews
+
+
+if __name__ == "__main__":
+
+    async def run_single_user_test():
+        test_user = "user"
+        print(f"Initialising test async session for user: {test_user}")
+
+        async with AsyncSession(impersonate="chrome120") as client:
+            try:
+                reviews = await fetch_user_reviews(
+                    client, username=test_user, max_pages=2
+                )
+
+                print(f"\nTotal reviews captured: {len(reviews)}")
+                for idx, r in enumerate(reviews[:3], 1):
+                    stars = f"{r.rating}★" if r.rating else "unrated"
+                    print(f"\n[{idx}] {r.film} ({r.year}) - {stars}")
+                    print(f"    Text snippet: {r.text[:80]}...")
+
+            except ScrapeError as e:
+                print(f"ScrapeError caught: {e}")
+            except Exception as e:
+                print(f"Unexpected error during fetch: {e}")
+
+    asyncio.run(run_single_user_test())
